@@ -124,13 +124,13 @@ class BaseDeviceAdaptor:
         if use_mxfp_quant:
             raise RuntimeError("MXFP MoE quantization is only supported on Ascend A5.")
 
-        return torch_npu.npu_grouped_matmul_swiglu_quant(
+        return torch.ops._C_ascend.grouped_matmul_swiglu_quant(
             x=x,
             weight=weight,
-            bias=bias,
-            group_list=group_list,
             weight_scale=weight_scale,
             x_scale=x_scale,
+            group_list=group_list,
+            bias=bias,
         )
 
     @staticmethod
@@ -190,7 +190,7 @@ class BaseDeviceAdaptor:
         )[0]
 
     @staticmethod
-    def mla_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_starts, key, value):
+    def kv_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_starts, key, value):
         torch_npu.atb.npu_paged_cache_load(
             cache_kv_c,
             cache_k_pe,
@@ -553,12 +553,12 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         )[0]
 
     @staticmethod
-    def mla_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_offset, key, value):
+    def kv_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_offset, key, value):
         torch_npu.npu_gather_pa_kv_cache(
             cache_kv_c,
             cache_k_pe,
             block_table,
-            context_seq_len_npu,
+            context_seq_len_npu.contiguous(),
             seq_offset=seq_offset,
             key=key,
             value=value,

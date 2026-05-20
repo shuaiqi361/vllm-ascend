@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -80,7 +81,7 @@ class AscendConfig:
             )
 
         # Dump / PrecisionDebugger configuration
-        self.dump_config_path = additional_config.get("dump_config_path", None)
+        self.dump_config_path = self._resolve_dump_config_path(additional_config)
         self.layer_sharding = additional_config.get("layer_sharding", None)
         if self.layer_sharding:
             logger.info_once(
@@ -120,6 +121,7 @@ class AscendConfig:
         # PD-disaggregated only (kv_producer/kv_consumer); invalid in PD-mixed (kv_both / no kv_transfer_config).
         self.recompute_scheduler_enable = additional_config.get("recompute_scheduler_enable", False)
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
+        self.multistream_dsa_preprocess = additional_config.get("multistream_dsa_preprocess", False)
 
         self.pd_tp_ratio = 1
         self.pd_head_ratio = 1
@@ -218,6 +220,34 @@ class AscendConfig:
         if self.enable_hamming_sparse:
             if isinstance(self.sparse_json, str) and not os.path.isfile(self.sparse_json):
                 raise ValueError("Hamming sparse config json file doesn't exist.")
+
+    @staticmethod
+    def _materialize_dump_config_to_file(dump_config: dict[str, Any]) -> str:
+        dump_config_dir = os.path.join(os.getcwd(), ".vllm_ascend", "msprobe")
+        os.makedirs(dump_config_dir, exist_ok=True)
+        dump_config_file_path = os.path.join(dump_config_dir, "msprobe_dump_config.json")
+        with open(dump_config_file_path, "w", encoding="utf-8") as file:
+            json.dump(dump_config, file, ensure_ascii=False, indent=2)
+        logger.info("Materialized additional_config.dump_config to file: %s", dump_config_file_path)
+        return dump_config_file_path
+
+    @classmethod
+    def _resolve_dump_config_path(cls, additional_config: dict[str, Any]) -> str | None:
+        dump_config_path = additional_config.get("dump_config_path")
+        dump_config = additional_config.get("dump_config")
+        if dump_config_path is not None and dump_config is not None:
+            raise ValueError(
+                "Only one of additional_config.dump_config_path or additional_config.dump_config can be set."
+            )
+        if dump_config is not None:
+            if not isinstance(dump_config, dict):
+                raise ValueError(f"additional_config.dump_config must be a dict, got {type(dump_config).__name__}.")
+            return cls._materialize_dump_config_to_file(dump_config)
+        if dump_config_path is not None and not isinstance(dump_config_path, str):
+            raise ValueError(
+                f"additional_config.dump_config_path must be a string, got {type(dump_config_path).__name__}."
+            )
+        return dump_config_path
 
     @staticmethod
     def _has_sparse_c8_layer_config(quant_config: Any) -> bool:
@@ -319,17 +349,28 @@ class FinegrainedTPConfig:
         self.lmhead_tensor_parallel_size = finegrained_tp_config.get("lmhead_tensor_parallel_size", 0)
         self.embedding_tensor_parallel_size = finegrained_tp_config.get("embedding_tensor_parallel_size", 0)
         self.mlp_tensor_parallel_size = finegrained_tp_config.get("mlp_tensor_parallel_size", 0)
+        self.olora_tensor_parallel_size = finegrained_tp_config.get("olora_tensor_parallel_size", 0)
 
         enabled_configs = []
         if self.oproj_tensor_parallel_size > 0:
             enabled_configs.append(f"oproj_tensor_parallel_size={self.oproj_tensor_parallel_size}")
             # dummy_run does not run the entire attention module in eager mode,
             # so the o_proj tp split can only be used in graph mode.
-            if vllm_config.model_config.enforce_eager is True:
+            if vllm_config.model_config.enforce_eager:
                 raise AssertionError("oproj_tensor_parallel_size is only supported in graph mode")
             if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
                 raise AssertionError(
                     "oproj_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
+                )
+        if self.olora_tensor_parallel_size > 0:
+            enabled_configs.append(f"olora_tensor_parallel_size={self.olora_tensor_parallel_size}")
+            # dummy_run does not run the entire attention module in eager mode,
+            # so the o_lora tp split can only be used in graph mode.
+            if vllm_config.model_config.enforce_eager is True:
+                raise AssertionError("olora_tensor_parallel_size is only supported in graph mode")
+            if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
+                raise AssertionError(
+                    "olora_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
                 )
         if self.lmhead_tensor_parallel_size > 0:
             enabled_configs.append(f"lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size}")
@@ -342,6 +383,7 @@ class FinegrainedTPConfig:
             self.lmhead_tensor_parallel_size,
             self.embedding_tensor_parallel_size,
             self.mlp_tensor_parallel_size,
+            self.olora_tensor_parallel_size,
         ]
         for module_tp_size in module_tp_sizes:
             if module_tp_size > 0 and vllm_config.parallel_config.data_parallel_size % module_tp_size != 0:
