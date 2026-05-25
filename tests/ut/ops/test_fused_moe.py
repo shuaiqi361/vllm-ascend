@@ -383,7 +383,9 @@ class TestAscendUnquantizedFusedMoEMethod:
         format_cast = MagicMock(side_effect=lambda weight, _: weight)
         maybe_trans_nz = MagicMock(side_effect=lambda weight: weight)
 
-        monkeypatch.setattr(fused_moe_module.envs_ascend, "VLLM_ASCEND_ENABLE_FUSED_MC2", enable_fused_mc2)
+        mock_ascend_config = MagicMock()
+        mock_ascend_config.enable_fused_mc2 = enable_fused_mc2
+        monkeypatch.setattr(fused_moe_module, "get_ascend_config", lambda: mock_ascend_config)
         monkeypatch.setattr(fused_moe_module.torch_npu, "npu_format_cast", format_cast)
         monkeypatch.setattr(fused_moe_module, "maybe_trans_nz", maybe_trans_nz)
 
@@ -502,17 +504,23 @@ class TestAscendUnquantizedFusedMoEMethod:
 
 class TestAscendMoERunner:
     @pytest.mark.parametrize(
-        "moe_comm_type, expected",
+        "moe_comm_type, flash_comm_v1_enabled, expected",
         [
-            (MoECommType.ALLTOALL, True),
-            (MoECommType.MC2, True),
-            (MoECommType.FUSED_MC2, True),
-            (MoECommType.ALLGATHER, False),
+            (MoECommType.ALLTOALL, False, True),
+            (MoECommType.MC2, False, True),
+            (MoECommType.FUSED_MC2, False, True),
+            (MoECommType.ALLGATHER, False, False),
+            (MoECommType.ALLGATHER, True, True),
         ],
     )
-    def test_runner_reduction_properties(self, monkeypatch, moe_comm_type, expected):
+    def test_runner_reduction_properties(self, monkeypatch, moe_comm_type, flash_comm_v1_enabled, expected):
         runner = AscendMoERunner.__new__(AscendMoERunner)
         monkeypatch.setattr(fused_moe_module, "_EXTRA_CTX", SimpleNamespace(moe_comm_type=moe_comm_type))
+        monkeypatch.setattr(
+            fused_moe_module,
+            "_EXTRA_CTX",
+            SimpleNamespace(moe_comm_type=moe_comm_type, flash_comm_v1_enabled=flash_comm_v1_enabled),
+        )
 
         assert runner.use_dp_chunking is False
         if hasattr(type(runner), "_fused_output_is_reduced"):
@@ -774,6 +782,7 @@ class TestAscendFusedMoESharedExperts:
             pytest.skip("Current AscendFusedMoE has no shared_forward_impl")
         layer.multistream_overlap_shared_expert = False
         layer.shared_multistream_overlap_gate = False
+        layer.use_overlapped = False
         layer._shared_experts = MagicMock() if has_shared_experts else None
         hidden_states = torch.randn(2, 4)
         router_logits = torch.randn(2, 3)
