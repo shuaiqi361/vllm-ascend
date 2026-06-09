@@ -71,6 +71,22 @@ class ExpertOffloadManager:
         self.last_miss_experts: list[list[int]] = []
         self._debug_update_weights = self.offload_config.cache_debug_log_updates
 
+        # --- Proactive expert prefetch (optional extension; default OFF) ---
+        self.prefetch_enabled = self.offload_config.prefetch_enabled
+        self.num_prefetch_experts = self.offload_config.num_prefetch_experts
+        # Built in create_weights() once layer counts are known; stays None
+        # (and the whole feature dormant) when prefetch_enabled is False.
+        self.prefetcher = None
+        # Per-layer LRC residency snapshot (host-side), refreshed each time a
+        # layer is paged. The prefetcher reads it to avoid staging experts that
+        # the LRC cache already holds — the sole coupling between the two caches.
+        self._lrc_resident_per_layer: list[set[int]] = []
+        # Per-step request attribution for the EAM (Plan-B) predictor, set once
+        # per decode step by the model runner via note_decode_batch(). Stays
+        # None (and EAM degrades to per-batch) if the runner does not supply it.
+        self._cur_req_ids: list | None = None
+        self._cur_req_row_index = None
+
         ExpertOffloadManager._instance = self
 
         self.load_stream = torch_npu.npu.Stream()
@@ -137,6 +153,18 @@ class ExpertOffloadManager:
                 age_weight=self.offload_config.cache_age_weight,
             )
 
+        # Initialise the LRC-residency snapshot to the startup identity mapping
+        # (experts 0..ndev-1 are warm-loaded into slots 0..ndev-1).
+        self._lrc_resident_per_layer = [
+            set(range(min(self.num_device_experts, num_total_experts)))
+            for _ in range(num_moe_layers)
+        ]
+
+        # Build the proactive prefetcher (its NPU staging tensors are allocated
+        # later, in maybe_allocate_prefetcher, once device weights exist).
+        if self.prefetch_enabled:
+            self._build_prefetcher(num_moe_layers, num_total_experts)
+
         # update weights related buffers
         self.topk_ids_h = torch.zeros(
             [self.offload_threshold, self.topk],
@@ -152,6 +180,66 @@ class ExpertOffloadManager:
         )
         self.log2phy_h = torch.zeros(num_total_experts, dtype=torch.int32, device='cpu', pin_memory=True)
         self.log2phy_np = self.log2phy_h.numpy()
+
+    def _build_prefetcher(self, num_moe_layers: int, num_total_experts: int):
+        """Construct the proactive prefetcher (NPU tensors allocated later)."""
+        from vllm_ascend.ascend_config import get_ascend_config
+        from vllm_ascend.expert_offload.expert_prefetcher import ExpertPrefetcher
+
+        # The prefetcher and EPLB would both mutate per-layer expert placement
+        # with no shared arbitration, so refuse to run together.
+        eplb_config = getattr(get_ascend_config(), "eplb_config", None)
+        if eplb_config is not None and getattr(eplb_config, "dynamic_eplb", False):
+            raise ValueError(
+                "expert prefetch (prefetch_enabled) is incompatible with "
+                "dynamic_eplb; enable at most one.")
+        self.prefetcher = ExpertPrefetcher(
+            manager=self,
+            num_moe_layers=num_moe_layers,
+            num_total_experts=num_total_experts,
+            capacity=self.num_prefetch_experts,
+            horizon=self.offload_config.prefetch_horizon,
+            history_window=self.offload_config.prefetch_history_window,
+            predictor_kind=self.offload_config.prefetch_predictor,
+            eamc_capacity=self.offload_config.prefetch_eamc_capacity,
+            debug=self.offload_config.prefetch_debug_log,
+        )
+
+    def maybe_allocate_prefetcher(self):
+        """Allocate the prefetch staging tensors (after device weights exist)."""
+        if self.prefetcher is not None:
+            self.prefetcher.allocate()
+
+    def lrc_resident_for_layer(self, layer_idx: int) -> set[int]:
+        """LRC-cache residents for ``layer_idx`` as of its last paging."""
+        return self._lrc_resident_per_layer[layer_idx]
+
+    def note_decode_batch(self, req_ids, req_row_index):
+        """Record this step's request attribution for the EAM predictor.
+
+        Called once per decode step by the model runner (gated on prefetch).
+        ``req_ids`` is the batch's request ids in order; ``req_row_index`` maps
+        each token row to its index in ``req_ids``. Optional — when absent the
+        EAM predictor degrades to treating the batch as one request.
+        """
+        self._cur_req_ids = list(req_ids) if req_ids is not None else None
+        self._cur_req_row_index = req_row_index
+
+    def _attribute_requests(self, topk_ids_h) -> dict | None:
+        """Group this layer's routed experts by request id (EAM mode)."""
+        if self._cur_req_ids is None or self._cur_req_row_index is None:
+            return None
+        rows = topk_ids_h.tolist()
+        if len(self._cur_req_row_index) < len(rows):
+            return None  # attribution out of sync — degrade to per-batch
+        per_req: dict[str, set[int]] = {}
+        for row_idx, expert_row in enumerate(rows):
+            req_idx = int(self._cur_req_row_index[row_idx])
+            if req_idx >= len(self._cur_req_ids):
+                return None
+            rid = self._cur_req_ids[req_idx]
+            per_req.setdefault(rid, set()).update(int(e) for e in expert_row)
+        return per_req
 
     def process_weights_after_loading(self):
         first_w13 = self.w13_weights_cpu[0][0]
@@ -677,32 +765,43 @@ class ExpertOffloadManager:
                         layer_idx, len(need_to_load) - n_copies,
                         sorted(list(need_to_load))[n_copies:][:20])
                     break  # no free slots — should not happen in normal usage
-                # Copy weights from CPU to NPU
-                layer.w13_weight.data.untyped_storage()[slot * self.w13_expert_size_bytes : (slot + 1) * self.w13_expert_size_bytes].copy_(
-                    self.w13_weights_cpu[layer_idx][eid].untyped_storage()
-                )
-                layer.w2_weight.data.untyped_storage()[slot * self.w2_expert_size_bytes : (slot + 1) * self.w2_expert_size_bytes].copy_(
-                    self.w2_weights_cpu[layer_idx][eid].untyped_storage()
-                )
-                # Copy scales/offsets from CPU to NPU
-                for attr_name, buffers in self.scale_cpu_buffers.items():
-                    if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
-                        continue
-                    dev_tensor = getattr(layer, attr_name, None)
-                    if dev_tensor is None:
-                        continue
-                    dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
-                for attr_name, buffers in self.offset_cpu_buffers.items():
-                    if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
-                        continue
-                    dev_tensor = getattr(layer, attr_name, None)
-                    if dev_tensor is None:
-                        continue
-                    dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
-                # Refresh derived fp32 scale if present (W8A8_DYNAMIC)
-                if hasattr(layer, 'w13_weight_scale_fp32'):
-                    layer.w13_weight_scale_fp32[slot].copy_(
-                        layer.w13_weight_scale.data[slot].to(torch.float32))
+                # Proactive-prefetch fast path: if this expert was already
+                # staged into the prefetch cache (its slow CPU->HBM copy paid
+                # ahead of time), promote it into the LRC slot with a fast
+                # on-device D2D copy instead of a fresh CPU->NPU H2D. Falls back
+                # to the H2D below on a miss or a not-yet-landed prefetch.
+                promoted = False
+                if self.prefetcher is not None and not _EXTRA_CTX.capturing:
+                    promoted = self.prefetcher.try_promote(layer, layer_idx, eid, slot)
+                if not promoted:
+                    # Copy weights from CPU to NPU
+                    w13_lo, w13_hi = slot * self.w13_expert_size_bytes, (slot + 1) * self.w13_expert_size_bytes
+                    w2_lo, w2_hi = slot * self.w2_expert_size_bytes, (slot + 1) * self.w2_expert_size_bytes
+                    layer.w13_weight.data.untyped_storage()[w13_lo:w13_hi].copy_(
+                        self.w13_weights_cpu[layer_idx][eid].untyped_storage()
+                    )
+                    layer.w2_weight.data.untyped_storage()[w2_lo:w2_hi].copy_(
+                        self.w2_weights_cpu[layer_idx][eid].untyped_storage()
+                    )
+                    # Copy scales/offsets from CPU to NPU
+                    for attr_name, buffers in self.scale_cpu_buffers.items():
+                        if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                            continue
+                        dev_tensor = getattr(layer, attr_name, None)
+                        if dev_tensor is None:
+                            continue
+                        dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
+                    for attr_name, buffers in self.offset_cpu_buffers.items():
+                        if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                            continue
+                        dev_tensor = getattr(layer, attr_name, None)
+                        if dev_tensor is None:
+                            continue
+                        dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
+                    # Refresh derived fp32 scale if present (W8A8_DYNAMIC)
+                    if hasattr(layer, 'w13_weight_scale_fp32'):
+                        layer.w13_weight_scale_fp32[slot].copy_(
+                            layer.w13_weight_scale.data[slot].to(torch.float32))
                 # Update mapping
                 if victim is None:
                     victim = slot_owner[slot]
@@ -712,6 +811,19 @@ class ExpertOffloadManager:
                 if slot in reusable_slots:
                     reusable_slots.remove(slot)
                 n_copies += 1
+
+            # Refresh this layer's LRC residency snapshot (read by the
+            # prefetcher when deciding what to stage for future layers) and
+            # issue proactive prefetches on the separate prefetch stream.
+            self._lrc_resident_per_layer[layer_idx] = set(slot_owner.values())
+            if self.prefetcher is not None and not _EXTRA_CTX.capturing:
+                if layer_idx == 0:
+                    # First MoE layer of the step: retire departed requests.
+                    self.prefetcher.sync_requests(self._cur_req_ids)
+                per_req = (self._attribute_requests(topk_ids_h)
+                           if self.prefetcher.requires_request_context else None)
+                self.prefetcher.observe_routing(layer_idx, needed, per_req)
+                self.prefetcher.run(layer_idx)
 
             self.load_stream.synchronize()
 

@@ -629,6 +629,33 @@ class ExpertOffloadConfig:
         "cache_age_weight": 0.01,
         "cache_stats_log_interval": 1000,
         "cache_debug_log_updates": False,
+        # --- Proactive expert prefetch (extends offload; default OFF) ---
+        # Master switch. Only meaningful when expert_offload is True. When
+        # False, the offload path behaves exactly as before (no extra VRAM,
+        # no extra host work).
+        "prefetch_enabled": False,
+        # Size of the *separate* prefetch staging cache, in expert slots per
+        # MoE layer. This is independent of num_device_experts (the LRC cache)
+        # and costs additional HBM (num_prefetch_experts x per-expert-bytes x
+        # num_moe_layers). Must be > 0 for prefetch to do anything.
+        "num_prefetch_experts": 0,
+        # How many future layers to predict + prefetch for, each decode step.
+        "prefetch_horizon": 2,
+        # Recent-history window (in decode steps) used by the default
+        # (Plan-A) recent-union predictor.
+        "prefetch_history_window": 8,
+        # Which predictor drives the prefetcher:
+        #   "recent_union" — Plan A: global recent-history union (no per-request
+        #                    state; lowest overhead).
+        #   "eam"          — Plan B: MoE-Infinity-style per-request Expert
+        #                    Activation Matrix + cosine match to finished
+        #                    requests for cold start.
+        "prefetch_predictor": "recent_union",
+        # Capacity (number of finished-request EAMs) of the EAM collection,
+        # used only by the "eam" predictor.
+        "prefetch_eamc_capacity": 256,
+        # Debug logging for the prefetcher (hit/issue counts).
+        "prefetch_debug_log": False,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -689,6 +716,34 @@ class ExpertOffloadConfig:
             raise ValueError("cache_stats_log_interval must >= 0")
         if not isinstance(self.config["cache_debug_log_updates"], bool):
             raise TypeError("cache_debug_log_updates must be a boolean")
+        # --- Proactive expert prefetch validation ---
+        if not isinstance(self.config["prefetch_enabled"], bool):
+            raise TypeError("prefetch_enabled must be a boolean")
+        if not isinstance(self.config["num_prefetch_experts"], int):
+            raise TypeError("num_prefetch_experts must be an integer")
+        if self.config["num_prefetch_experts"] < 0:
+            raise ValueError(f"num_prefetch_experts must >= 0; got {self.config['num_prefetch_experts']} instead")
+        if not isinstance(self.config["prefetch_horizon"], int):
+            raise TypeError("prefetch_horizon must be an integer")
+        if self.config["prefetch_horizon"] < 1:
+            raise ValueError(f"prefetch_horizon must >= 1; got {self.config['prefetch_horizon']} instead")
+        if not isinstance(self.config["prefetch_history_window"], int):
+            raise TypeError("prefetch_history_window must be an integer")
+        if self.config["prefetch_history_window"] < 1:
+            raise ValueError(f"prefetch_history_window must >= 1; got {self.config['prefetch_history_window']} instead")
+        if self.config["prefetch_predictor"] not in ("recent_union", "eam"):
+            raise ValueError("prefetch_predictor must be 'recent_union' or 'eam'")
+        if not isinstance(self.config["prefetch_eamc_capacity"], int):
+            raise TypeError("prefetch_eamc_capacity must be an integer")
+        if self.config["prefetch_eamc_capacity"] < 1:
+            raise ValueError(f"prefetch_eamc_capacity must >= 1; got {self.config['prefetch_eamc_capacity']} instead")
+        if not isinstance(self.config["prefetch_debug_log"], bool):
+            raise TypeError("prefetch_debug_log must be a boolean")
+        if self.config["prefetch_enabled"]:
+            if not self.config["expert_offload"]:
+                raise ValueError("prefetch_enabled requires expert_offload to be True")
+            if self.config["num_prefetch_experts"] < 1:
+                raise ValueError("prefetch_enabled requires num_prefetch_experts >= 1")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

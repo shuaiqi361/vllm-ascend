@@ -972,6 +972,13 @@ class NPUModelRunner(GPUModelRunner):
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
 
+        # Supply per-request attribution to the expert prefetcher's EAM
+        # predictor (no-op unless proactive prefetch is enabled). Optional:
+        # the prefetcher degrades gracefully if this is never called.
+        _offload_mgr = getattr(self, "offload_manager", None)
+        if _offload_mgr is not None and getattr(_offload_mgr, "prefetcher", None) is not None:
+            _offload_mgr.note_decode_batch(self.input_batch.req_ids, req_indices)
+
         self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
@@ -3419,6 +3426,10 @@ class NPUModelRunner(GPUModelRunner):
         # Create prefill pool for large-batch (num_tokens > threshold) path
         t_e = time.perf_counter()
         self.offload_manager.create_prefill_pool()
+        # Allocate the proactive-prefetch staging cache (no-op unless
+        # prefetch_enabled). Must run after device weights + scale buffers
+        # exist so the staging tensors mirror their shapes/format.
+        self.offload_manager.maybe_allocate_prefetcher()
         t_f = time.perf_counter()
         logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  "
                      "init_device=%.1fs  prefill_pool=%.1fs",
