@@ -1,45 +1,50 @@
-"""Proactive expert prefetcher — the NPU execution engine for the staging cache.
+"""Proactive expert prefetcher — NPU execution engine for the unified cache.
 
 This is the torch/NPU half of the proactive-prefetch feature (the CPU-only
-"brain" lives in :mod:`prefetch_predictor` and :mod:`prefetch_cache_policy`).
-It is an *optional extension* of :class:`ExpertOffloadManager`: when
-``prefetch_enabled`` is off, none of this is constructed and the offload path
-is byte-for-byte unchanged.
+"brain" lives in :mod:`prefetch_predictor`). It is an *optional extension* of
+:class:`ExpertOffloadManager`: when ``prefetch_enabled`` is off, none of this is
+constructed and the offload path is byte-for-byte unchanged.
 
-Design (kept intentionally independent of the LRC demand-paging cache):
+Design — one cache, no copies on a hit (MoE-Infinity style):
 
-* A **separate** per-layer staging tensor of ``num_prefetch_experts`` slots
-  holds prefetched experts. It is distinct from ``layer.w13_weight`` (the LRC
-  cache) and governed solely by :class:`PrefetchCachePolicy`.
-* During layer ``L``'s decode paging, we predict the experts that the next
-  ``horizon`` layers will need and issue **async** CPU->staging H2D copies on a
-  dedicated ``prefetch_stream``, overlapping them with ongoing compute.
-* The two caches meet at exactly one point: before staging an expert we check
-  whether it is already resident in the LRC cache (``lrc_resident``) and skip
-  it if so.
-* When a layer actually needs an expert that we staged, the manager *promotes*
-  it into an LRC slot with a fast on-device **D2D** copy (the slow PCIe H2D was
-  already paid, ahead of time). On a miss/late-arrival the manager falls back
-  to the normal synchronous CPU->LRC H2D, so correctness never depends on a
-  prediction being right.
+* There is exactly **one** on-device expert cache per MoE layer: the layer's
+  real weight pool (``layer.w13_weight`` / ``w2_weight``, ``num_device_experts``
+  slots). Prefetched experts are loaded **directly into that pool** — there is
+  no separate staging buffer and therefore no device-to-device promote. Once an
+  expert is on device it is simply *used where it sits*.
+* Residency is the manager's per-layer host ``log2phy`` mirror (expert -> slot),
+  the single source of truth shared by demand paging and the prefetcher. So a
+  prefetched expert is visible to the demand path as already-resident: the
+  demand path finds a cache hit and moves on with **no copy**. An expert can
+  therefore live in only one place — the unified cache — never two.
+* During the decode step's first MoE layer we predict the experts that **every
+  remaining layer** of the step will need (MoE-Infinity prefetches the whole
+  request ahead, not just the next layer) and issue **async** CPU->pool H2D
+  copies on a dedicated ``prefetch_stream``, nearest layers first so the most
+  imminent layers win the bandwidth. Each layer is predicted+issued once per
+  step (recent-union predictions for a layer are constant until that layer is
+  itself observed), keeping the sweep O(num_layers) per step.
+* When a layer is paged and a needed expert was prefetched, the manager orders
+  the consuming stream after the prefetch's completion event (``wait_for_landed``)
+  so the kernel never reads a half-written slot. If the prefetch has not been
+  issued (cold / mispredict) the demand path loads it synchronously as before —
+  correctness never depends on a prediction being right.
 
-Scope for this (Plan-A) version: single-rank, eager mode. Under ACL-graph
-capture the manager bypasses the prefetcher entirely, so capture behaves
-exactly as it did before this feature.
+Scope for this version: single-rank, eager mode. Under ACL-graph capture the
+manager skips ``run``/event waits, so capture behaves exactly as before this
+feature; the host mirror still tracks every device mutation so residency stays
+consistent across the capture/eager boundary.
 """
 
-import torch
 import torch_npu
 from vllm.logger import logger
 
 from vllm_ascend.expert_offload.eam_predictor import EAMPredictor
-from vllm_ascend.expert_offload.prefetch_cache_policy import PrefetchCachePolicy
 from vllm_ascend.expert_offload.prefetch_predictor import RecentUnionPredictor
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 
 class ExpertPrefetcher:
-    """Predicts and stages future-layer experts into a separate NPU cache."""
+    """Predicts future-layer experts and stages them into the unified cache."""
 
     def __init__(
         self,
@@ -56,7 +61,12 @@ class ExpertPrefetcher:
         self.manager = manager
         self.num_moe_layers = num_moe_layers
         self.num_total_experts = num_total_experts
+        # Max experts the prefetcher may proactively stage into one layer's pool
+        # per step (a speculation budget on the shared cache, not a separate
+        # allocation). <= num_device_experts in practice.
         self.capacity = capacity
+        # How many layers ahead to prefetch. <= 0 means "all remaining layers
+        # this step" (the MoE-Infinity whole-request lookahead).
         self.horizon = horizon
         self.debug = debug
 
@@ -68,28 +78,27 @@ class ExpertPrefetcher:
                 num_moe_layers, num_total_experts, eamc_capacity=eamc_capacity)
         else:
             self.predictor = RecentUnionPredictor(num_moe_layers, history_window)
-        self.policy = PrefetchCachePolicy(num_moe_layers, num_total_experts, capacity)
 
         self.prefetch_stream = torch_npu.npu.Stream()
         # (layer_idx, expert_id) -> completion Event for the in-flight/landed H2D
-        self._events: dict[tuple[int, int], torch_npu.npu.Event] = {}
-        self._event_pool: list[torch_npu.npu.Event] = []
+        self._events: dict[tuple[int, int], "torch_npu.npu.Event"] = {}
+        self._event_pool: list["torch_npu.npu.Event"] = []
 
-        # Per-layer staging tensors (allocated lazily once device weights exist)
-        self._pf_w13: list[torch.Tensor] = []
-        self._pf_w2: list[torch.Tensor] = []
-        self._pf_scale: dict[str, list[torch.Tensor]] = {}
-        self._pf_offset: dict[str, list[torch.Tensor]] = {}
-        self._pf_w13_scale_fp32: list[torch.Tensor] = []
+        # Highest future layer already prefetched this decode step (reset at the
+        # step's first MoE layer) so each layer is staged exactly once per step.
+        self._cursor = 0
+        # Last layer index passed to run(); a non-increasing index marks a new
+        # decode step. Seeded above num_moe_layers so the very first call resets.
+        self._last_run_layer = num_moe_layers
         self._initialized = False
 
         # Lightweight counters for [PREFETCH] stats.
-        self.n_issued = 0
-        self.n_hits = 0
-        self.n_late = 0
+        self.n_issued = 0   # CPU->pool prefetch copies issued
+        self.n_hits = 0     # needed experts found already-landed in the cache
+        self.n_late = 0     # needed experts staged but not yet landed (stalled)
 
     # ------------------------------------------------------------------ #
-    #  Allocation (called after device weights + scale buffers exist)     #
+    #  Allocation (no staging tensors — just validate prerequisites)      #
     # ------------------------------------------------------------------ #
 
     def allocate(self) -> None:
@@ -98,55 +107,17 @@ class ExpertPrefetcher:
         mgr = self.manager
         if not mgr.moe_layers:
             return
-        layer0 = mgr.moe_layers[0]
-        dev = layer0.w13_weight.device
-        dt = layer0.w13_weight.dtype
-        cap = self.capacity
-        is_int8 = dt == torch.int8
-
-        for _ in range(self.num_moe_layers):
-            t13 = torch.empty((cap,) + tuple(layer0.w13_weight.shape[1:]),
-                              dtype=dt, device=dev)
-            t2 = torch.empty((cap,) + tuple(layer0.w2_weight.shape[1:]),
-                             dtype=dt, device=dev)
-            if is_int8:
-                # W8A8 kernels require NZ; match the LRC tensor layout so the
-                # storage-slice copies are byte-identical.
-                t13 = torch_npu.npu_format_cast(t13, ACL_FORMAT_FRACTAL_NZ)
-                t2 = torch_npu.npu_format_cast(t2, ACL_FORMAT_FRACTAL_NZ)
-            self._pf_w13.append(t13)
-            self._pf_w2.append(t2)
-
-        # Per-attr scale/offset staging, mirroring the manager's CPU buffers.
-        for attr in mgr.scale_cpu_buffers:
-            self._pf_scale[attr] = []
-        for attr in mgr.offset_cpu_buffers:
-            self._pf_offset[attr] = []
-        for layer in mgr.moe_layers:
-            for attr, staging in self._pf_scale.items():
-                dev_tensor = getattr(layer, attr, None)
-                staging.append(
-                    None if dev_tensor is None else
-                    torch.empty((cap,) + tuple(dev_tensor.shape[1:]),
-                                dtype=dev_tensor.dtype, device=dev))
-            for attr, staging in self._pf_offset.items():
-                dev_tensor = getattr(layer, attr, None)
-                staging.append(
-                    None if dev_tensor is None else
-                    torch.empty((cap,) + tuple(dev_tensor.shape[1:]),
-                                dtype=dev_tensor.dtype, device=dev))
-            if hasattr(layer, "w13_weight_scale_fp32"):
-                self._pf_w13_scale_fp32.append(
-                    torch.empty((cap,) + tuple(layer.w13_weight_scale_fp32.shape[1:]),
-                                dtype=torch.float32, device=dev))
-
+        if mgr.cache_policy is None:
+            logger.warning(
+                "[PREFETCH] disabled: the unified-cache prefetcher needs the "
+                "LRC cache policy (cache_policy_enabled) for slot eviction.")
+            return
         self._initialized = True
         logger.warning(
-            "[PREFETCH] allocated staging cache: %d layers x %d slots, "
-            "w13[0].shape=%s w2[0].shape=%s horizon=%d",
-            self.num_moe_layers, cap,
-            tuple(self._pf_w13[0].shape), tuple(self._pf_w2[0].shape),
-            self.horizon)
+            "[PREFETCH] unified-cache prefetch active: layers=%d budget=%d/layer "
+            "horizon=%s predictor=%s",
+            self.num_moe_layers, self.capacity,
+            "all" if self.horizon <= 0 else self.horizon, self.predictor_kind)
 
     # ------------------------------------------------------------------ #
     #  Prediction substrate                                               #
@@ -154,7 +125,7 @@ class ExpertPrefetcher:
 
     def observe_routing(self, layer_idx: int, needed: set[int],
                         per_req_experts: dict | None) -> None:
-        """Feed this layer's routing to the predictor.
+        """Feed this layer's actual routing to the predictor.
 
         ``per_req_experts`` maps request id -> routed-expert set (EAM mode). For
         the recent-union predictor it is ignored. If EAM mode is on but the
@@ -177,145 +148,155 @@ class ExpertPrefetcher:
             self.predictor.sync_active(ids)
 
     # ------------------------------------------------------------------ #
-    #  Issue: stage predicted experts for the next `horizon` layers       #
+    #  Issue: stage predicted experts for every remaining layer this step #
     # ------------------------------------------------------------------ #
 
     def run(self, current_layer_idx: int) -> None:
         """Predict + async-stage experts for layers ahead of ``current_layer_idx``.
 
-        Must be called on the host (eager path) after the current layer's LRC
-        paging. Issues non-blocking H2D copies on ``prefetch_stream``; nothing
-        here blocks compute.
+        Called on the host (eager path) after the current layer's demand paging.
+        Issues non-blocking CPU->pool H2D copies on ``prefetch_stream``; nothing
+        here blocks compute. Each future layer is staged at most once per step
+        (cursor-guarded), so the whole sweep is O(num_layers) per step.
         """
         if not self._initialized:
             return
-        mgr = self.manager
-        sz13 = mgr.w13_expert_size_bytes
-        sz2 = mgr.w2_expert_size_bytes
         last = self.num_moe_layers - 1
-
-        for target in range(current_layer_idx + 1,
-                            min(current_layer_idx + self.horizon, last) + 1):
-            predicted = self.predictor.predict(target)
-            if not predicted:
-                continue
-            lrc_resident = mgr.lrc_resident_for_layer(target)
-            loading = self._loading_set(target)
-            plan = self.policy.plan_loads(target, predicted, lrc_resident, loading)
-            if not plan:
-                continue
-
-            with torch_npu.npu.stream(self.prefetch_stream):
-                for load in plan:
-                    eid, slot = load.expert_id, load.slot
-                    self._pf_w13[target].untyped_storage()[
-                        slot * sz13:(slot + 1) * sz13].copy_(
-                        mgr.w13_weights_cpu[target][eid].untyped_storage(),
-                        non_blocking=True)
-                    self._pf_w2[target].untyped_storage()[
-                        slot * sz2:(slot + 1) * sz2].copy_(
-                        mgr.w2_weights_cpu[target][eid].untyped_storage(),
-                        non_blocking=True)
-                    self._stage_scales(target, eid, slot)
-
-                    event = self._acquire_event()
-                    event.record(self.prefetch_stream)
-                    # Drop any stale event for an expert this load evicted.
-                    if load.evicted_expert is not None:
-                        self._release_event(
-                            self._events.pop((target, load.evicted_expert), None))
-                    self._events[(target, eid)] = event
-                    self.n_issued += 1
+        # The decode step walks MoE layers in increasing order; a non-increasing
+        # index means a new step began, so reset the per-step cursor. (Detecting
+        # the boundary by wrap rather than assuming the step's first layer is
+        # index 0 keeps this correct if a rank doesn't host layer 0.)
+        if current_layer_idx <= self._last_run_layer:
+            self._cursor = current_layer_idx + 1
+        self._last_run_layer = current_layer_idx
+        hi = last if self.horizon <= 0 else min(current_layer_idx + self.horizon, last)
+        start = max(self._cursor, current_layer_idx + 1)
+        for target in range(start, hi + 1):
+            self._prefetch_layer(target)
+        self._cursor = max(self._cursor, hi + 1)
 
         if self.debug:
             logger.warning(
-                "[PREFETCH] after l=%d issued_total=%d hits_total=%d late_total=%d",
-                current_layer_idx, self.n_issued, self.n_hits, self.n_late)
+                "[PREFETCH] after l=%d cursor=%d issued_total=%d hits_total=%d "
+                "late_total=%d", current_layer_idx, self._cursor,
+                self.n_issued, self.n_hits, self.n_late)
 
-    def _stage_scales(self, target: int, eid: int, slot: int) -> None:
-        """Copy W8A8 scale/offset (and derived fp32 scale) into the staging slot."""
+    def _prefetch_layer(self, target: int) -> None:
+        """Stage ``target``'s predicted, not-yet-resident experts into its pool."""
         mgr = self.manager
-        for attr, buffers in mgr.scale_cpu_buffers.items():
-            staging = self._pf_scale.get(attr)
-            if (staging is None or target >= len(staging) or staging[target] is None
-                    or target >= len(buffers) or eid >= len(buffers[target])):
-                continue
-            staging[target][slot].copy_(buffers[target][eid], non_blocking=True)
-        for attr, buffers in mgr.offset_cpu_buffers.items():
-            staging = self._pf_offset.get(attr)
-            if (staging is None or target >= len(staging) or staging[target] is None
-                    or target >= len(buffers) or eid >= len(buffers[target])):
-                continue
-            staging[target][slot].copy_(buffers[target][eid], non_blocking=True)
-        if self._pf_w13_scale_fp32 and target < len(self._pf_w13_scale_fp32):
-            scale_staging = self._pf_scale.get("w13_weight_scale")
-            if (scale_staging is not None and target < len(scale_staging)
-                    and scale_staging[target] is not None):
-                self._pf_w13_scale_fp32[target][slot].copy_(
-                    scale_staging[target][slot].to(torch.float32))
+        policy = mgr.cache_policy
+        predicted = self.predictor.predict(target)
+        if not predicted:
+            return
+        mirror = mgr.log2phy_host(target)
+        slot_owner = mgr.slot_owner_for_layer(target)   # {slot: expert_id}
+        resident = set(slot_owner.values())
+        npool = mgr.pool_slots(target)
+        free = [s for s in range(npool) if s not in slot_owner]
+        loading = self._loading_set(target)
+        protected = set(predicted)
+        layer = mgr.moe_layers[target]
+        staged = 0
+
+        with torch_npu.npu.stream(self.prefetch_stream):
+            for eid in predicted:
+                if staged >= self.capacity:
+                    break
+                if eid in resident:
+                    continue  # already in the one unified cache — never duplicate
+                if free:
+                    slot = free.pop()
+                    victim = None
+                else:
+                    victim = policy.choose_victim(
+                        target, slot_owner, protected=protected, loading=loading)
+                    if victim is None:
+                        break  # pool full of wanted / in-flight experts
+                    slot = int(mirror[victim])
+
+                # Async CPU->pool H2D straight into the real slot. No staging
+                # tensor, no later D2D: the kernel will read the expert here.
+                mgr._copy_expert_into_slot(layer, target, eid, slot,
+                                           non_blocking=True)
+                event = self._acquire_event()
+                event.record(self.prefetch_stream)
+
+                if victim is not None:
+                    mirror[victim] = -1
+                    slot_owner.pop(slot, None)
+                    resident.discard(victim)
+                    self._release_event(self._events.pop((target, victim), None))
+                mirror[eid] = slot
+                slot_owner[slot] = eid
+                resident.add(eid)
+                loading.add(eid)
+                self._events[(target, eid)] = event
+                staged += 1
+                self.n_issued += 1
 
     # ------------------------------------------------------------------ #
-    #  Consume: promote a staged expert into an LRC slot (fast D2D)        #
+    #  Consume: the demand path queries these when paging a layer         #
     # ------------------------------------------------------------------ #
 
-    def try_promote(self, layer, layer_idx: int, eid: int, lrc_slot: int) -> bool:
-        """Promote staged expert ``eid`` into LRC ``lrc_slot`` via on-device copy.
+    def wait_for_landed(self, layer_idx: int, experts, stream) -> None:
+        """Order ``stream`` after the prefetch H2D of each given needed expert.
 
-        MUST be called from within the manager's ``load_stream`` context so the
-        D2D copies are enqueued on that stream. Returns False (and does nothing)
-        when ``eid`` is not staged or its H2D has not landed yet — the caller
-        then performs the normal CPU->LRC H2D.
+        Called for the layer's cache *hits*. A hit that came from prefetch may
+        not have landed yet; making ``stream`` wait on its completion event (the
+        manager then synchronises that stream before the kernel) guarantees the
+        slot is fully written before it is read — without a host stall when the
+        copy already finished. Experts loaded by ordinary demand paging have no
+        event and are skipped.
         """
-        if not self._initialized:
-            return False
-        if not self.policy.is_resident(layer_idx, eid):
-            return False
-        event = self._events.get((layer_idx, eid))
-        if event is None or not event.query():
-            # Predicted but not yet landed — don't stall; fall back to H2D.
-            if event is not None:
+        for eid in experts:
+            event = self._events.pop((layer_idx, eid), None)
+            if event is None:
+                continue
+            if event.query():
+                self.n_hits += 1
+            else:
+                stream.wait_event(event)
                 self.n_late += 1
-            return False
-        pf_slot = self.policy.slot_of(layer_idx, eid)
-        mgr = self.manager
-        sz13 = mgr.w13_expert_size_bytes
-        sz2 = mgr.w2_expert_size_bytes
+            self._release_event(event)
 
-        # Order the D2D after the staging H2D (no host stall: query() was True).
-        mgr.load_stream.wait_event(event)
-        layer.w13_weight.data.untyped_storage()[
-            lrc_slot * sz13:(lrc_slot + 1) * sz13].copy_(
-            self._pf_w13[layer_idx].untyped_storage()[
-                pf_slot * sz13:(pf_slot + 1) * sz13])
-        layer.w2_weight.data.untyped_storage()[
-            lrc_slot * sz2:(lrc_slot + 1) * sz2].copy_(
-            self._pf_w2[layer_idx].untyped_storage()[
-                pf_slot * sz2:(pf_slot + 1) * sz2])
-        for attr, staging in self._pf_scale.items():
-            dev_tensor = getattr(layer, attr, None)
-            if dev_tensor is None or layer_idx >= len(staging) or staging[layer_idx] is None:
-                continue
-            dev_tensor.data[lrc_slot].copy_(staging[layer_idx][pf_slot])
-        for attr, staging in self._pf_offset.items():
-            dev_tensor = getattr(layer, attr, None)
-            if dev_tensor is None or layer_idx >= len(staging) or staging[layer_idx] is None:
-                continue
-            dev_tensor.data[lrc_slot].copy_(staging[layer_idx][pf_slot])
-        if hasattr(layer, "w13_weight_scale_fp32"):
-            layer.w13_weight_scale_fp32[lrc_slot].copy_(
-                layer.w13_weight_scale.data[lrc_slot].to(torch.float32))
+    def pending_event_experts(self, layer_idx: int) -> set[int]:
+        """Experts with an *in-flight* prefetch into ``layer_idx`` (don't evict).
 
-        self._release_event(self._events.pop((layer_idx, eid), None))
-        self.policy.on_consumed(layer_idx, eid)
-        self.n_hits += 1
-        return True
+        Recycles any events that have already landed so the table stays bounded.
+        """
+        pending: set[int] = set()
+        landed: list[tuple[int, int]] = []
+        for key, event in self._events.items():
+            if key[0] != layer_idx:
+                continue
+            if event.query():
+                landed.append(key)
+            else:
+                pending.add(key[1])
+        for key in landed:
+            self._release_event(self._events.pop(key, None))
+        return pending
+
+    def note_evicted(self, layer_idx: int, expert_id: int, stream) -> None:
+        """A demand load is about to overwrite ``expert_id``'s slot.
+
+        If a prefetch into that slot is still in flight, order the overwriting
+        ``stream`` after it so we never corrupt a half-written copy. Then drop
+        the (now moot) event.
+        """
+        event = self._events.pop((layer_idx, expert_id), None)
+        if event is None:
+            return
+        if not event.query():
+            stream.wait_event(event)
+        self._release_event(event)
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
     # ------------------------------------------------------------------ #
 
     def _loading_set(self, layer_idx: int) -> set[int]:
-        """Experts whose staging copy hasn't landed — don't evict to make room."""
+        """Experts whose prefetch copy hasn't landed — don't evict to make room."""
         loading: set[int] = set()
         for (l_idx, eid), event in self._events.items():
             if l_idx == layer_idx and not event.query():

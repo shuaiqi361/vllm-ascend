@@ -3426,9 +3426,10 @@ class NPUModelRunner(GPUModelRunner):
         # Create prefill pool for large-batch (num_tokens > threshold) path
         t_e = time.perf_counter()
         self.offload_manager.create_prefill_pool()
-        # Allocate the proactive-prefetch staging cache (no-op unless
-        # prefetch_enabled). Must run after device weights + scale buffers
-        # exist so the staging tensors mirror their shapes/format.
+        # Activate the proactive prefetcher (no-op unless prefetch_enabled).
+        # Must run after device weights + scale buffers exist (it stages experts
+        # directly into the layers' real weight pools — there is no separate
+        # staging cache).
         self.offload_manager.maybe_allocate_prefetcher()
         t_f = time.perf_counter()
         logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  "

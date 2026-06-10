@@ -634,13 +634,16 @@ class ExpertOffloadConfig:
         # False, the offload path behaves exactly as before (no extra VRAM,
         # no extra host work).
         "prefetch_enabled": False,
-        # Size of the *separate* prefetch staging cache, in expert slots per
-        # MoE layer. This is independent of num_device_experts (the LRC cache)
-        # and costs additional HBM (num_prefetch_experts x per-expert-bytes x
-        # num_moe_layers). Must be > 0 for prefetch to do anything.
+        # Speculation budget: the max experts the prefetcher may proactively
+        # stage into ONE layer per step. Prefetched experts land directly in the
+        # layer's real weight pool (the single unified cache, num_device_experts
+        # slots) — there is NO separate staging buffer and no extra HBM. Keep
+        # this <= num_device_experts. Must be > 0 for prefetch to do anything.
         "num_prefetch_experts": 0,
-        # How many future layers to predict + prefetch for, each decode step.
-        "prefetch_horizon": 2,
+        # How many layers ahead to predict + prefetch each decode step. 0 means
+        # "all remaining layers this step" (MoE-Infinity-style whole-request
+        # lookahead, nearest layers first); a positive value caps the lookahead.
+        "prefetch_horizon": 0,
         # Recent-history window (in decode steps) used by the default
         # (Plan-A) recent-union predictor.
         "prefetch_history_window": 8,
@@ -725,8 +728,8 @@ class ExpertOffloadConfig:
             raise ValueError(f"num_prefetch_experts must >= 0; got {self.config['num_prefetch_experts']} instead")
         if not isinstance(self.config["prefetch_horizon"], int):
             raise TypeError("prefetch_horizon must be an integer")
-        if self.config["prefetch_horizon"] < 1:
-            raise ValueError(f"prefetch_horizon must >= 1; got {self.config['prefetch_horizon']} instead")
+        if self.config["prefetch_horizon"] < 0:
+            raise ValueError(f"prefetch_horizon must >= 0 (0 = all remaining layers); got {self.config['prefetch_horizon']} instead")
         if not isinstance(self.config["prefetch_history_window"], int):
             raise TypeError("prefetch_history_window must be an integer")
         if self.config["prefetch_history_window"] < 1:
@@ -744,6 +747,11 @@ class ExpertOffloadConfig:
                 raise ValueError("prefetch_enabled requires expert_offload to be True")
             if self.config["num_prefetch_experts"] < 1:
                 raise ValueError("prefetch_enabled requires num_prefetch_experts >= 1")
+            if not self.config["cache_policy_enabled"]:
+                # The unified-cache prefetcher reuses the LRC cache policy for
+                # slot eviction; without it there is no hotness signal to pick
+                # victims when staging into a full pool.
+                raise ValueError("prefetch_enabled requires cache_policy_enabled to be True")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
