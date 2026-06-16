@@ -200,6 +200,28 @@
 #       Remove this patch once the supported vLLM version contains the upstream
 #       GLM47 inline zero-argument streaming parser fix.
 #
+# ** 7c. File: platform/patch_dflash_accept_rate.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler.make_spec_decoding_stats`
+#      `vllm.v1.core.sched.scheduler.Scheduler.update_from_output`
+#      `vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat`
+#    Why:
+#       vLLM computes a per-request accepted-token count each spec-decode step but
+#       folds it into an engine-wide aggregate and discards the per-request value,
+#       so DFlash per-request acceptance cannot be measured from `vllm bench serve`.
+#    How:
+#       Accumulate per-request (draft, accepted) in the scheduler, ship them to the
+#       api-server process via the existing `EngineCoreOutput.kv_transfer_params`
+#       dict side-channel, and surface them on
+#       `usage.completion_tokens_details.{accepted,rejected}_prediction_tokens`.
+#       Each hook is guarded so a missing vLLM symbol disables the feature instead
+#       of breaking startup. Pairs with `benchmarks/dflash_accept_bench.py`.
+#    Related PR (if no, explain why):
+#       No, vllm-ascend-local profiling instrumentation.
+#    Future Plan:
+#       Remove if upstream vLLM exposes per-request spec-decode acceptance on the
+#       OpenAI usage / RequestOutput.
+#
 # ** 10a. File: platform/patch_kv_cache_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes`

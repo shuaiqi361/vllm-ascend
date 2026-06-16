@@ -30,6 +30,7 @@ else:
     import vllm_ascend.patch.platform.patch_mamba_config_310  # noqa
 import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
 import vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa
+import vllm_ascend.patch.platform.patch_dflash_accept_rate  # noqa  # per-request DFlash acceptance accounting (after minimax usage patch so it composes)
 import vllm_ascend.patch.platform.patch_glm_tool_call_streaming  # noqa
 import vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser  # noqa
 import vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa
